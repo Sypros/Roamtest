@@ -1,20 +1,18 @@
-// roamtest laptop server: UDP echo for the phone's simulated call, plus a
-// local web dashboard that stores every uploaded run and compares them.
+// RoamTest laptop app: UDP echo for the phone's simulated call, discovery so the
+// phone finds the laptop, and a dashboard (own window on Windows) that stores
+// every walk per project and compares them.
 package main
 
 import (
-	"strings"
 	_ "embed"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"runtime"
-	"sort"
+	"strings"
+	"sync"
 	"time"
 )
 
@@ -22,143 +20,168 @@ import (
 var dashboard []byte
 
 const (
-	udpPort  = 5005
-	httpPort = 8080
+	udpPort       = 5005
+	discoveryPort = 5006
+	httpPort      = 8080
 )
 
-var runsDir string
+var st *store
+
+// live state of the phone's test traffic
+var live struct {
+	sync.Mutex
+	addr    string
+	last    time.Time
+	started time.Time
+	packets int64
+}
 
 func main() {
+	dir := dataDir()
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		fatal("Cannot create data folder " + dir + ": " + err.Error())
+	}
 	exe, _ := os.Executable()
-	runsDir = filepath.Join(filepath.Dir(exe), "roamtest-runs")
-	os.MkdirAll(runsDir, 0755)
+	st = newStore(dir, filepath.Join(filepath.Dir(exe), "roamtest-runs"))
+
+	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", httpPort))
+	if err != nil {
+		alreadyRunning()
+		return
+	}
 
 	go echo()
 	go discovery()
 
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
 		w.Write(dashboard)
 	})
-	http.HandleFunc("/upload", upload)
-	http.HandleFunc("/api/runs", listRuns)
-	http.HandleFunc("/api/run", getRun)
-	http.HandleFunc("/api/delete", deleteRun)
-	http.HandleFunc("/api/baseline", baselineHandler)
+	mux.HandleFunc("/upload", upload)
+	mux.HandleFunc("/api/state", apiState)
+	mux.HandleFunc("/api/runs", apiRuns)
+	mux.HandleFunc("/api/run", apiRun)
+	mux.HandleFunc("/api/delete", apiDelete)
+	mux.HandleFunc("/api/baseline", apiBaseline)
+	mux.HandleFunc("/api/project/new", apiProjectNew)
+	mux.HandleFunc("/api/project/open", apiProjectOpen)
+	mux.HandleFunc("/api/project/rename", apiProjectRename)
+	mux.HandleFunc("/api/export", apiExport)
+	go http.Serve(ln, mux)
 
-	fmt.Println("==============================================")
-	fmt.Println(" RoamTest server")
-	fmt.Println("==============================================")
-	fmt.Println(" Use one of these IPs on the phone:")
-	for _, ip := range localIPs() {
-		fmt.Println("    ", ip)
-	}
-	fmt.Printf("\n Phone app finds this laptop automatically (Find button).\n Termux tool:    ./roamtest <ip> <label>\n")
-	fmt.Printf(" Dashboard:      http://localhost:%d\n", httpPort)
-	fmt.Printf(" Runs saved in:  %s\n", runsDir)
-	fmt.Println("\n If the phone gets no replies, allow this program")
-	fmt.Println(" through the firewall (UDP 5005, TCP 8080).")
-	fmt.Println("==============================================")
-
-	go func() {
-		time.Sleep(700 * time.Millisecond)
-		openBrowser(fmt.Sprintf("http://localhost:%d", httpPort))
-	}()
-
-	if err := http.ListenAndServe(fmt.Sprintf(":%d", httpPort), nil); err != nil {
-		fmt.Println("Web server error:", err)
-		fmt.Println("Press Enter to exit")
-		fmt.Scanln()
-	}
+	runUI(fmt.Sprintf("http://localhost:%d/", httpPort), dir)
 }
+
+// ------------------------------------------------------------------ network
 
 func echo() {
 	pc, err := net.ListenPacket("udp", fmt.Sprintf(":%d", udpPort))
 	if err != nil {
-		fmt.Println("Cannot listen on UDP", udpPort, err)
 		return
 	}
 	buf := make([]byte, 2048)
-	var last time.Time
 	for {
 		n, addr, err := pc.ReadFrom(buf)
 		if err != nil {
 			continue
 		}
 		pc.WriteTo(buf[:n], addr)
-		if time.Since(last) > 30*time.Second {
-			fmt.Printf("[%s] receiving test traffic from %s\n", time.Now().Format("15:04:05"), addr)
+		now := time.Now()
+		live.Lock()
+		if now.Sub(live.last) > 3*time.Second {
+			live.started = now
+			live.packets = 0
 		}
-		last = time.Now()
+		live.addr = addr.(*net.UDPAddr).IP.String()
+		live.last = now
+		live.packets++
+		live.Unlock()
 	}
 }
 
-func upload(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "POST only", 405)
-		return
-	}
-	body, err := io.ReadAll(io.LimitReader(r.Body, 50<<20))
+// discovery answers the phone app's "ROAMTEST?" broadcast so nobody has to type an IP.
+func discovery() {
+	pc, err := net.ListenPacket("udp4", fmt.Sprintf(":%d", discoveryPort))
 	if err != nil {
-		http.Error(w, err.Error(), 400)
 		return
 	}
-	var run struct {
-		Summary struct {
-			ID    string `json:"id"`
-			Label string `json:"label"`
-		} `json:"summary"`
-	}
-	if json.Unmarshal(body, &run) != nil || run.Summary.ID == "" {
-		http.Error(w, "bad run data", 400)
-		return
-	}
-	id := filepath.Base(run.Summary.ID)
-	os.WriteFile(filepath.Join(runsDir, id+".json"), body, 0644)
-	fmt.Printf("[%s] run saved: %s\n", time.Now().Format("15:04:05"), run.Summary.Label)
-	w.Write([]byte("ok"))
-}
-
-func listRuns(w http.ResponseWriter, r *http.Request) {
-	files, _ := filepath.Glob(filepath.Join(runsDir, "*.json"))
-	sort.Strings(files)
-	var out []json.RawMessage
-	for _, f := range files {
-		data, err := os.ReadFile(f)
+	host, _ := os.Hostname()
+	buf := make([]byte, 64)
+	for {
+		n, addr, err := pc.ReadFrom(buf)
 		if err != nil {
 			continue
 		}
-		var run struct {
-			Summary map[string]any `json:"summary"`
-			Rows    []struct {
-				Freq  int    `json:"freq"`
-				Event string `json:"event"`
-			} `json:"rows"`
+		if strings.HasPrefix(string(buf[:n]), "ROAMTEST?") {
+			pc.WriteTo([]byte("ROAMTEST "+host), addr)
 		}
-		if json.Unmarshal(data, &run) != nil || run.Summary == nil {
-			continue
-		}
-		hops := 0
-		for i := 1; i < len(run.Rows); i++ {
-			if run.Rows[i].Event != "" && band(run.Rows[i].Freq) != band(run.Rows[i-1].Freq) {
-				hops++
-			}
-		}
-		run.Summary["band_hops"] = hops
-		b, _ := json.Marshal(run.Summary)
-		out = append(out, b)
 	}
-	w.Header().Set("Content-Type", "application/json")
-	if out == nil {
-		w.Write([]byte("[]"))
-		return
-	}
-	json.NewEncoder(w).Encode(out)
 }
 
-func getRun(w http.ResponseWriter, r *http.Request) {
-	id := filepath.Base(r.URL.Query().Get("id"))
-	data, err := os.ReadFile(filepath.Join(runsDir, id+".json"))
+func localIPs() []map[string]string {
+	var ips []map[string]string
+	ifaces, _ := net.Interfaces()
+	for _, i := range ifaces {
+		if i.Flags&net.FlagUp == 0 || i.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, _ := i.Addrs()
+		for _, a := range addrs {
+			if n, ok := a.(*net.IPNet); ok && n.IP.To4() != nil && !n.IP.IsLinkLocalUnicast() {
+				ips = append(ips, map[string]string{"ip": n.IP.String(), "iface": i.Name})
+			}
+		}
+	}
+	return ips
+}
+
+// ---------------------------------------------------------------------- API
+
+func writeJSON(w http.ResponseWriter, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	json.NewEncoder(w).Encode(v)
+}
+
+func apiState(w http.ResponseWriter, r *http.Request) {
+	st.mu.Lock()
+	cur, _ := st.load(st.current)
+	list := st.projects()
+	ver := st.version
+	st.mu.Unlock()
+
+	live.Lock()
+	active := time.Since(live.last) < 2*time.Second
+	l := map[string]any{"active": active, "phone": live.addr,
+		"seconds": 0}
+	if active {
+		l["seconds"] = int(time.Since(live.started).Seconds())
+	}
+	if !live.last.IsZero() {
+		l["ago"] = int(time.Since(live.last).Seconds())
+	}
+	live.Unlock()
+
+	host, _ := os.Hostname()
+	writeJSON(w, map[string]any{
+		"project": cur, "projects": list, "version": ver,
+		"live": l, "ips": localIPs(), "host": host, "dataDir": st.dir,
+	})
+}
+
+func apiRuns(w http.ResponseWriter, r *http.Request) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	writeJSON(w, st.runSummaries(st.current))
+}
+
+func apiRun(w http.ResponseWriter, r *http.Request) {
+	st.mu.Lock()
+	dir := st.runsDir(st.current)
+	st.mu.Unlock()
+	data, err := os.ReadFile(filepath.Join(dir, filepath.Base(r.URL.Query().Get("id"))+".json"))
 	if err != nil {
 		http.Error(w, "not found", 404)
 		return
@@ -167,42 +190,136 @@ func getRun(w http.ResponseWriter, r *http.Request) {
 	w.Write(data)
 }
 
-func deleteRun(w http.ResponseWriter, r *http.Request) {
+func upload(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "POST only", 405)
 		return
 	}
-	id := filepath.Base(r.URL.Query().Get("id"))
-	os.Rename(filepath.Join(runsDir, id+".json"), filepath.Join(runsDir, id+".json.deleted"))
+	body, err := readAllLimit(r.Body)
+	if err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	var run struct {
+		Summary struct {
+			ID string `json:"id"`
+		} `json:"summary"`
+	}
+	if json.Unmarshal(body, &run) != nil || run.Summary.ID == "" {
+		http.Error(w, "bad run data", 400)
+		return
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	os.MkdirAll(st.runsDir(st.current), 0755)
+	os.WriteFile(filepath.Join(st.runsDir(st.current), filepath.Base(run.Summary.ID)+".json"), body, 0644)
+	st.bump()
 	w.Write([]byte("ok"))
 }
 
-func localIPs() []string {
-	var ips []string
-	ifaces, _ := net.Interfaces()
-	for _, i := range ifaces {
-		if i.Flags&net.FlagUp == 0 || i.Flags&net.FlagLoopback != 0 {
-			continue
-		}
-		addrs, _ := i.Addrs()
-		for _, a := range addrs {
-			if n, ok := a.(*net.IPNet); ok && n.IP.To4() != nil {
-				ips = append(ips, fmt.Sprintf("%-16s (%s)", n.IP.String(), i.Name))
-			}
-		}
+func post(w http.ResponseWriter, r *http.Request) bool {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", 405)
+		return false
 	}
-	return ips
+	return true
 }
 
-func openBrowser(url string) {
-	switch runtime.GOOS {
-	case "windows":
-		exec.Command("rundll32", "url.dll,FileProtocolHandler", url).Start()
-	case "darwin":
-		exec.Command("open", url).Start()
-	default:
-		exec.Command("xdg-open", url).Start()
+func apiDelete(w http.ResponseWriter, r *http.Request) {
+	if !post(w, r) {
+		return
 	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	id := filepath.Base(r.URL.Query().Get("id"))
+	trash := filepath.Join(st.projectDir(st.current), "deleted")
+	os.MkdirAll(trash, 0755)
+	os.Rename(filepath.Join(st.runsDir(st.current), id+".json"), filepath.Join(trash, id+".json"))
+	st.bump()
+	w.Write([]byte("ok"))
+}
+
+func apiBaseline(w http.ResponseWriter, r *http.Request) {
+	if !post(w, r) {
+		return
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	p, ok := st.load(st.current)
+	if ok {
+		p.Baseline = filepath.Base(r.URL.Query().Get("id"))
+		st.save(p)
+		st.bump()
+	}
+	w.Write([]byte("ok"))
+}
+
+func apiProjectNew(w http.ResponseWriter, r *http.Request) {
+	if !post(w, r) {
+		return
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	p := st.create(r.URL.Query().Get("name"))
+	st.current = p.ID
+	st.saveCurrent()
+	st.bump()
+	writeJSON(w, p)
+}
+
+func apiProjectOpen(w http.ResponseWriter, r *http.Request) {
+	if !post(w, r) {
+		return
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	id := filepath.Base(r.URL.Query().Get("id"))
+	if _, ok := st.load(id); ok {
+		st.current = id
+		st.saveCurrent()
+		st.bump()
+	}
+	w.Write([]byte("ok"))
+}
+
+func apiProjectRename(w http.ResponseWriter, r *http.Request) {
+	if !post(w, r) {
+		return
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if p, ok := st.load(st.current); ok {
+		if name := strings.TrimSpace(r.URL.Query().Get("name")); name != "" {
+			p.Name = name
+			st.save(p)
+			st.bump()
+		}
+	}
+	w.Write([]byte("ok"))
+}
+
+func apiExport(w http.ResponseWriter, r *http.Request) {
+	st.mu.Lock()
+	id := r.URL.Query().Get("id")
+	if id == "" {
+		id = st.current
+	}
+	data, name, err := st.export(filepath.Base(id), dashboard)
+	st.mu.Unlock()
+	if err != nil {
+		http.Error(w, err.Error(), 404)
+		return
+	}
+	w.Header().Set("Content-Type", "application/zip")
+	w.Header().Set("Content-Disposition", `attachment; filename="`+name+`"`)
+	w.Write(data)
+}
+
+// -------------------------------------------------------------------- misc
+
+func exists(p string) bool {
+	_, err := os.Stat(p)
+	return err == nil
 }
 
 func band(f int) string {
@@ -215,34 +332,4 @@ func band(f int) string {
 		return "2.4G"
 	}
 	return "?"
-}
-
-func baselineHandler(w http.ResponseWriter, r *http.Request) {
-	f := filepath.Join(runsDir, "baseline.txt")
-	if r.Method == http.MethodPost {
-		os.WriteFile(f, []byte(filepath.Base(r.URL.Query().Get("id"))), 0644)
-	}
-	b, _ := os.ReadFile(f)
-	w.Write(b)
-}
-
-// discovery answers the phone app's "ROAMTEST?" broadcast so nobody has to type an IP.
-func discovery() {
-	pc, err := net.ListenPacket("udp4", ":5006")
-	if err != nil {
-		fmt.Println("Discovery unavailable (UDP 5006):", err)
-		return
-	}
-	host, _ := os.Hostname()
-	buf := make([]byte, 64)
-	for {
-		n, addr, err := pc.ReadFrom(buf)
-		if err != nil {
-			continue
-		}
-		if strings.HasPrefix(string(buf[:n]), "ROAMTEST?") {
-			pc.WriteTo([]byte("ROAMTEST "+host), addr)
-			fmt.Printf("[%s] phone %s found this laptop\n", time.Now().Format("15:04:05"), addr)
-		}
-	}
 }

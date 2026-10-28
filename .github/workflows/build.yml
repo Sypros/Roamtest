@@ -35,8 +35,8 @@ jobs:
         run: |
           mkdir -p out
           cp android/app/build/outputs/apk/release/app-release.apk out/RoamTest.apk
-          GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o out/RoamTest-Server-Windows.exe ./server
-          GOOS=darwin  GOARCH=arm64 go build -ldflags="-s -w" -o out/RoamTest-Server-Mac ./server
+          GOOS=windows GOARCH=amd64 go build -ldflags="-s -w -H windowsgui" -o out/RoamTest.exe ./server
+          GOOS=darwin  GOARCH=arm64 go build -ldflags="-s -w" -o out/RoamTest-Mac ./server
           CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o out/roamtest-termux ./cli
 
       - name: Publish as the 'latest' release
@@ -46,7 +46,7 @@ jobs:
           gh release delete latest --yes --cleanup-tag || true
           gh release create latest out/* \
             --title "RoamTest build ${{ github.run_number }}" \
-            --notes "Phone: install RoamTest.apk. Laptop: run RoamTest-Server-Windows.exe. Built from ${{ github.sha }}."
+            --notes "Phone: install RoamTest.apk. Laptop: run RoamTest.exe. Built from ${{ github.sha }}."
 
       - uses: actions/upload-artifact@v4
         with:
