@@ -337,6 +337,7 @@ func apiAPs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	aps := parseAPList(string(body))
+	_, site := parseOmadaCSV(string(body))
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	p, ok := st.load(st.current)
@@ -345,9 +346,13 @@ func apiAPs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p.APs = aps
+	// a fresh project still has its default name: take the Omada site name
+	if site != "" && (p.Name == "First project" || p.Name == "New project") {
+		p.Name = site
+	}
 	st.save(p)
 	st.bump()
-	writeJSON(w, map[string]any{"count": len(aps), "aps": aps})
+	writeJSON(w, map[string]any{"count": len(aps), "aps": aps, "site": site})
 }
 
 func apiExport(w http.ResponseWriter, r *http.Request) {
