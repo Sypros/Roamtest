@@ -15,7 +15,7 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.text.InputType;
-import android.text.method.DigitsKeyListener;
+import android.text.InputFilter;
 import android.net.ConnectivityManager;
 import android.net.LinkAddress;
 import android.net.LinkProperties;
@@ -106,9 +106,19 @@ public class MainActivity extends Activity {
         LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.HORIZONTAL);
         serverField = field("found automatically");
-        // number pad that still has a dot (phone pad has none)
-        serverField.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL);
-        serverField.setKeyListener(DigitsKeyListener.getInstance("0123456789."));
+        // Number pads show a comma in Belgian/Dutch locale, so use the URL keyboard
+        // (always has a dot) and turn any comma into a dot, dropping other characters.
+        serverField.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI
+                | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+        serverField.setFilters(new InputFilter[]{(src, start, end, dest, dstart, dend) -> {
+            StringBuilder b = new StringBuilder();
+            for (int i = start; i < end; i++) {
+                char c = src.charAt(i);
+                if (c == ',') c = '.';
+                if ((c >= '0' && c <= '9') || c == '.') b.append(c);
+            }
+            return b.length() == end - start && b.toString().contentEquals(src.subSequence(start, end)) ? null : b;
+        }});
         row.addView(serverField, new LinearLayout.LayoutParams(0, dp(52), 1));
         findBtn = button("Find", GREY);
         findBtn.setOnClickListener(v -> findLaptop());
