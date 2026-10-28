@@ -189,10 +189,12 @@ public class MainActivity extends Activity {
                 } else if (TestState.seconds == 0) {
                     state = "Starting...";
                     col = GREY;
-                } else if (g > 1000 || TestState.loss > 20) {
+                } else if (g > 1000 || TestState.loss > 50) {
+                    // calibrated on real walks: roams cost 150-300 ms and are fine;
+                    // gaps over a second are what callers notice
                     state = "DROPOUT";
                     col = RED;
-                } else if (g > 150 || TestState.loss > 5) {
+                } else if (g > 500 || TestState.loss > 20) {
                     state = "GLITCH";
                     col = AMBER;
                 } else {
