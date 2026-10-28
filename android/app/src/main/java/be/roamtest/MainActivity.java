@@ -15,6 +15,13 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.text.InputType;
+import android.text.method.DigitsKeyListener;
+import android.net.ConnectivityManager;
+import android.net.LinkAddress;
+import android.net.LinkProperties;
+import android.net.Network;
+import android.net.NetworkCapabilities;
+import java.net.Inet4Address;
 import android.view.Gravity;
 import android.view.View;
 import android.view.WindowManager;
@@ -99,7 +106,9 @@ public class MainActivity extends Activity {
         LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.HORIZONTAL);
         serverField = field("found automatically");
-        serverField.setInputType(InputType.TYPE_CLASS_PHONE);
+        // number pad that still has a dot (phone pad has none)
+        serverField.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL);
+        serverField.setKeyListener(DigitsKeyListener.getInstance("0123456789."));
         row.addView(serverField, new LinearLayout.LayoutParams(0, dp(52), 1));
         findBtn = button("Find", GREY);
         findBtn.setOnClickListener(v -> findLaptop());
@@ -268,37 +277,79 @@ public class MainActivity extends Activity {
         startForegroundService(i);
     }
 
-    /** Broadcasts "ROAMTEST?" on the LAN; the laptop server answers. */
+    /**
+     * Finds the laptop: asks "ROAMTEST?" on UDP 5006 by broadcast and, because many
+     * access points filter broadcasts from Wi-Fi clients, also directly to every
+     * address in the phone's Wi-Fi subnet. The socket is bound to Wi-Fi so the
+     * question never leaves over mobile data.
+     */
     private void findLaptop() {
         if (finding) return;
         finding = true;
         serverInfo.setText("Looking for the laptop...");
         new Thread(() -> {
-            String found = null, name = "";
+            String found = null, name = "", why = "";
             try (DatagramSocket s = new DatagramSocket()) {
                 s.setBroadcast(true);
-                s.setSoTimeout(800);
-                byte[] q = "ROAMTEST?".getBytes(StandardCharsets.US_ASCII);
-                byte[] buf = new byte[256];
-                for (int attempt = 0; attempt < 4 && found == null; attempt++) {
-                    s.send(new DatagramPacket(q, q.length,
-                            InetAddress.getByName("255.255.255.255"), DISCOVERY_PORT));
-                    try {
-                        DatagramPacket p = new DatagramPacket(buf, buf.length);
-                        s.receive(p);
-                        String reply = new String(p.getData(), 0, p.getLength(), StandardCharsets.UTF_8);
-                        if (reply.startsWith("ROAMTEST")) {
-                            found = p.getAddress().getHostAddress();
-                            name = reply.substring(8).trim();
+                Network wifiNet = null;
+                Inet4Address myIp = null;
+                int prefix = 24;
+                ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+                for (Network n : cm.getAllNetworks()) {
+                    NetworkCapabilities nc = cm.getNetworkCapabilities(n);
+                    if (nc == null || !nc.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) continue;
+                    LinkProperties lp = cm.getLinkProperties(n);
+                    if (lp == null) continue;
+                    for (LinkAddress la : lp.getLinkAddresses()) {
+                        if (la.getAddress() instanceof Inet4Address) {
+                            wifiNet = n;
+                            myIp = (Inet4Address) la.getAddress();
+                            prefix = la.getPrefixLength();
                         }
-                    } catch (Exception ignored) {
-                        // timeout, try again
                     }
                 }
-            } catch (Exception ignored) {
-                // no network
+                if (wifiNet == null || myIp == null) {
+                    why = "The phone is not on Wi-Fi.";
+                } else {
+                    wifiNet.bindSocket(s);
+                    byte[] q = "ROAMTEST?".getBytes(StandardCharsets.US_ASCII);
+                    int ip = java.nio.ByteBuffer.wrap(myIp.getAddress()).getInt();
+                    int bits = Math.max(prefix, 22); // never sweep more than 1022 hosts
+                    int mask = bits == 0 ? 0 : -1 << (32 - bits);
+                    int net = ip & mask, bcast = net | ~mask;
+
+                    String last = prefs.getString("server", "");
+                    if (!last.isEmpty()) send(s, q, InetAddress.getByName(last));
+                    send(s, q, InetAddress.getByName("255.255.255.255"));
+                    send(s, q, intToAddr(bcast));
+                    for (int h = net + 1; h < bcast; h++) {
+                        if (h != ip) send(s, q, intToAddr(h));
+                    }
+                    s.setSoTimeout(2500);
+                    byte[] buf = new byte[256];
+                    long deadline = System.currentTimeMillis() + 2500;
+                    while (found == null && System.currentTimeMillis() < deadline) {
+                        try {
+                            DatagramPacket p = new DatagramPacket(buf, buf.length);
+                            s.receive(p);
+                            String reply = new String(p.getData(), 0, p.getLength(), StandardCharsets.UTF_8);
+                            if (reply.startsWith("ROAMTEST ")) {
+                                found = p.getAddress().getHostAddress();
+                                name = reply.substring(9).trim();
+                            }
+                        } catch (Exception timeout) {
+                            break;
+                        }
+                    }
+                    if (found == null) {
+                        why = "No answer in " + intToAddr(net).getHostAddress() + "/" + bits
+                                + ". Is the laptop app open, on the same network, and allowed through its firewall?";
+                    }
+                }
+            } catch (Exception e) {
+                why = "Search failed: " + e.getMessage();
             }
-            final String ip = found, host = name;
+            final String ip = found, host = name, reason = why;
             ui.post(() -> {
                 finding = false;
                 if (ip != null) {
@@ -306,10 +357,22 @@ public class MainActivity extends Activity {
                     prefs.edit().putString("server", ip).apply();
                     serverInfo.setText("Found " + (host.isEmpty() ? "laptop" : host) + " at " + ip);
                 } else {
-                    serverInfo.setText("Not found. Is the server running and the laptop on the same network? You can also type its IP.");
+                    serverInfo.setText(reason + " You can also type its IP.");
                 }
             });
         }).start();
+    }
+
+    private static void send(DatagramSocket s, byte[] q, InetAddress to) {
+        try {
+            s.send(new DatagramPacket(q, q.length, to, DISCOVERY_PORT));
+        } catch (Exception ignored) {
+            // some addresses (e.g. the broadcast one) may be refused; keep going
+        }
+    }
+
+    private static InetAddress intToAddr(int v) throws Exception {
+        return InetAddress.getByAddress(java.nio.ByteBuffer.allocate(4).putInt(v).array());
     }
 
     private void uploadPending() {

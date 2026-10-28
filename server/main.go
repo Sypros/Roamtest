@@ -68,6 +68,7 @@ func main() {
 	mux.HandleFunc("/api/project/new", apiProjectNew)
 	mux.HandleFunc("/api/project/open", apiProjectOpen)
 	mux.HandleFunc("/api/project/rename", apiProjectRename)
+	mux.HandleFunc("/api/project/delete", apiProjectDelete)
 	mux.HandleFunc("/api/export", apiExport)
 	go http.Serve(ln, mux)
 
@@ -295,6 +296,31 @@ func apiProjectRename(w http.ResponseWriter, r *http.Request) {
 			st.bump()
 		}
 	}
+	w.Write([]byte("ok"))
+}
+
+// apiProjectDelete moves the open project to the "deleted" folder inside the
+// data folder (recoverable by hand) and opens the most recent other project.
+func apiProjectDelete(w http.ResponseWriter, r *http.Request) {
+	if !post(w, r) {
+		return
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	trash := filepath.Join(st.dir, "deleted")
+	os.MkdirAll(trash, 0755)
+	if err := os.Rename(st.projectDir(st.current), filepath.Join(trash, filepath.Base(st.current))); err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	list := st.projects()
+	if len(list) > 0 {
+		st.current = list[len(list)-1].ID
+	} else {
+		st.current = st.create("New project").ID
+	}
+	st.saveCurrent()
+	st.bump()
 	w.Write([]byte("ok"))
 }
 

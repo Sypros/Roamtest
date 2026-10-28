@@ -63,6 +63,7 @@ body.report .ctl{display:none!important}
   <span id="projName" style="font-weight:600;display:none"></span>
   <button class="ctl" id="btnNew">New project</button>
   <button class="ctl" id="btnRename">Rename</button>
+  <button class="ctl" id="btnDelete">Delete</button>
   <button class="ctl primary" id="btnExport">Export</button>
   <span class="grow"></span>
   <span class="live ctl"><span class="dot" id="dot"></span><span id="liveText">Waiting for the phone</span></span>
@@ -93,7 +94,7 @@ body.report .ctl{display:none!important}
   <div id="charts"></div>
 </main>
 <div class="tip" id="tip"></div>
-<div class="modal" id="modal"><div class="box"><b id="mTitle"></b><input id="mInput"><div class="row"><button id="mCancel">Cancel</button><button class="primary" id="mOk">OK</button></div></div></div>
+<div class="modal" id="modal"><div class="box"><b id="mTitle" style="display:block;margin-bottom:12px"></b><input id="mInput"><div class="row"><button id="mCancel">Cancel</button><button class="primary" id="mOk">OK</button></div></div></div>
 <script>
 let runs=[], baseId="", sel=new Set(), cache={}, sortKey="worst_roam_gap_ms", sortDir=1;
 const fmt=(v,u="")=>v==null?"-":(Math.round(v*10)/10)+u;
@@ -144,10 +145,13 @@ async function poll(){
     if(s.version!==version){ const first=version===null; await load(); version=s.version; if(first) runs.forEach(r=>seen.add(r.id)); }
   }catch(e){ document.getElementById("liveText").textContent="Disconnected"; }
 }
-function ask(title,value){
+function ask(title,value,confirmOnly){
   return new Promise(res=>{
     const m=document.getElementById("modal"), i=document.getElementById("mInput");
-    document.getElementById("mTitle").textContent=title; i.value=value||""; m.style.display="flex"; i.focus(); i.select();
+    i.style.display=confirmOnly?"none":"";
+    const ok=document.getElementById("mOk"); ok.textContent=confirmOnly||"OK";
+    ok.style.background=ok.style.borderColor=confirmOnly?"var(--bad)":"";
+    document.getElementById("mTitle").textContent=title; i.value=value||""; m.style.display="flex"; if(confirmOnly){document.getElementById("mOk").focus();}else{i.focus(); i.select();}
     const done=v=>{ m.style.display="none"; res(v); };
     document.getElementById("mOk").onclick=()=>done(i.value.trim());
     document.getElementById("mCancel").onclick=()=>done(null);
@@ -164,6 +168,12 @@ if(!R){
     const cur=document.querySelector("#proj option:checked");
     const n=await ask("Rename project", cur?cur.textContent.replace(/ \(\d+\)$/,""):"");
     if(n){ await api.post("/api/project/rename?name="+encodeURIComponent(n)); poll(); }
+  };
+  document.getElementById("btnDelete").onclick=async()=>{
+    const cur=document.querySelector("#proj option:checked");
+    const label=cur?cur.textContent:"this project";
+    const ok=await ask(`Delete project "${label}"? Export it first if you want to keep the results.`,"","Delete");
+    if(ok!==null){ await api.post("/api/project/delete"); poll(); }
   };
   document.getElementById("btnExport").onclick=()=>{ location.href="/api/export"; };
 }
