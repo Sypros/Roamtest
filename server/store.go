@@ -22,11 +22,12 @@ import (
 //	webview/                     window engine cache (Windows only)
 
 type Project struct {
-	ID       string `json:"id"`
-	Name     string `json:"name"`
-	Created  string `json:"created"`
-	Baseline string `json:"baseline"`
-	Runs     int    `json:"runs"`
+	ID       string            `json:"id"`
+	Name     string            `json:"name"`
+	Created  string            `json:"created"`
+	Baseline string            `json:"baseline"`
+	APs      map[string]string `json:"aps,omitempty"`
+	Runs     int               `json:"runs"`
 }
 
 type store struct {

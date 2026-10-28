@@ -63,6 +63,7 @@ body.report .ctl{display:none!important}
   <span id="projName" style="font-weight:600;display:none"></span>
   <button class="ctl" id="btnNew">New project</button>
   <button class="ctl" id="btnRename">Rename</button>
+  <button class="ctl" id="btnAPs">AP names</button>
   <button class="ctl" id="btnDelete">Delete</button>
   <button class="ctl primary" id="btnExport">Export</button>
   <span class="grow"></span>
@@ -94,6 +95,12 @@ body.report .ctl{display:none!important}
   <div id="charts"></div>
 </main>
 <div class="tip" id="tip"></div>
+<div class="modal" id="apModal"><div class="box" style="width:min(640px,92vw)">
+  <b style="display:block;margin-bottom:6px">AP names for this project</b>
+  <div class="sub" style="font-size:13px">In Omada open <b>Devices</b>, select the list with the mouse (from the first device name to the last MAC address), press Ctrl+C and paste it here. Names and MAC addresses are picked out automatically; other columns are ignored.</div>
+  <textarea id="apText" style="width:100%;height:220px;margin:12px 0;font:12px/1.4 Consolas,monospace;padding:8px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--ink)" placeholder="Paste the Omada device list here"></textarea>
+  <div class="row" style="align-items:center"><span class="sub" id="apCount" style="margin-right:auto"></span><button id="apCancel">Cancel</button><button class="primary" id="apSave">Save</button></div>
+</div></div>
 <div class="modal" id="modal"><div class="box"><b id="mTitle" style="display:block;margin-bottom:12px"></b><input id="mInput"><div class="row"><button id="mCancel">Cancel</button><button class="primary" id="mOk">OK</button></div></div></div>
 <script>
 let runs=[], baseId="", sel=new Set(), cache={}, sortKey="worst_roam_gap_ms", sortDir=1;
@@ -110,6 +117,21 @@ function verdict(s){
 }
 function cls(v,warn,bad){return v>=bad?"v-bad":v>=warn?"v-warn":"v-good"}
 const R=window.REPORT||null;
+let apMap={};
+function macBytes(m){ const p=String(m||"").toLowerCase().split(/[-:]/).map(x=>parseInt(x,16)); return p.length===6&&p.every(n=>n>=0)?p:null; }
+// A BSSID is the AP's MAC with the "local" bit set in the first byte and a small
+// number added to the last byte (one per band/SSID), e.g. A8-..-03-80 -> aa:..:03:82.
+function apName(bssid){
+  const b=macBytes(bssid); if(!b) return "";
+  let best="";
+  for(const [mac,name] of Object.entries(apMap)){
+    const a=macBytes(mac); if(!a) continue;
+    if(a.every((v,i)=>v===b[i])) return name;
+    if((a[0]|2)===(b[0]|2)&&a[1]===b[1]&&a[2]===b[2]&&a[3]===b[3]&&a[4]===b[4]&&(a[5]&0xF0)===(b[5]&0xF0)) best=name;
+  }
+  return best;
+}
+const shortName=n=>{ const p=n.split(" - "); return p[p.length-1]; };
 let version=null, projectId=null;
 if(R) document.body.classList.add("report");
 const api={
@@ -132,6 +154,8 @@ async function poll(){
     const s=await (await fetch("/api/state",{cache:"no-store"})).json();
     if(s.project.id!==projectId){ projectId=s.project.id; sel.clear(); seen.clear(); cache={}; version=null; }
     baseId=s.project.baseline||"";
+    const newAps=s.project.aps||{};
+    if(JSON.stringify(newAps)!==JSON.stringify(apMap)){ apMap=newAps; if(version!==null) drawCharts(); }
     const pj=document.getElementById("proj");
     pj.innerHTML=s.projects.slice().reverse().map(p=>`<option value="${esc(p.id)}" ${p.id===s.project.id?"selected":""}>${esc(p.name)} (${p.runs})</option>`).join("");
     document.title="RoamTest - "+s.project.name;
@@ -141,7 +165,8 @@ async function poll(){
     document.getElementById("liveText").textContent= L.active
       ? `Phone ${L.phone} testing · ${Math.floor(L.seconds/60)}:${String(L.seconds%60).padStart(2,"0")}`
       : (L.phone? `Phone ${L.phone} idle` : "Waiting for the phone");
-    document.getElementById("hint").textContent=`This laptop: ${ips||"no network"} · the phone app finds it automatically`;
+    const nAps=Object.keys(apMap).length;
+    document.getElementById("hint").textContent=`This laptop: ${ips||"no network"} · the phone app finds it automatically · `+(nAps?`${nAps} AP names loaded`:"tip: AP names shows Omada names instead of MAC addresses");
     if(s.version!==version){ const first=version===null; await load(); version=s.version; if(first) runs.forEach(r=>seen.add(r.id)); }
   }catch(e){ document.getElementById("liveText").textContent="Disconnected"; }
 }
@@ -168,6 +193,16 @@ if(!R){
     const cur=document.querySelector("#proj option:checked");
     const n=await ask("Rename project", cur?cur.textContent.replace(/ \(\d+\)$/,""):"");
     if(n){ await api.post("/api/project/rename?name="+encodeURIComponent(n)); poll(); }
+  };
+  document.getElementById("btnAPs").onclick=()=>{
+    const m=document.getElementById("apModal"), t=document.getElementById("apText");
+    t.value=Object.entries(apMap).map(([mac,n])=>n+"\t"+mac.toUpperCase().replace(/:/g,"-")).join("\n");
+    const count=()=>{ const n=(t.value.match(/\b[0-9a-f]{2}([-:][0-9a-f]{2}){5}\b/gi)||[]).length; document.getElementById("apCount").textContent=n?`${n} MAC addresses found`:""; };
+    t.oninput=count; count(); m.style.display="flex"; t.focus(); t.select();
+    document.getElementById("apCancel").onclick=()=>m.style.display="none";
+    document.getElementById("apSave").onclick=async()=>{
+      await fetch("/api/aps",{method:"POST",body:t.value}); m.style.display="none"; poll();
+    };
   };
   document.getElementById("btnDelete").onclick=async()=>{
     const cur=document.querySelector("#proj option:checked");
@@ -258,7 +293,7 @@ function chart(rows,maxT,maxG){
   rows.forEach((r,i)=>{ if(!r.event) return;
     const p=rows[i-1]||r, hop=band(p.freq)!==band(r.freq);
     h+=`<line x1="${x(r.t)}" x2="${x(r.t)}" y1="${T}" y2="${T+ih}" stroke="var(--roam)" stroke-width="1" opacity=".7" ${hop?'stroke-dasharray="5 3"':""}/>`;
-    h+=`<text x="${x(r.t)+3}" y="${T+10}" style="fill:var(--roam);font-size:9px">${hop?band(p.freq)+"→"+band(r.freq):"AP"}</text>`;
+    h+=`<text x="${x(r.t)+3}" y="${T+10}" style="fill:var(--roam);font-size:9px">${esc((hop?band(p.freq)+"→"+band(r.freq)+" ":"")+(apName(r.bssid)?shortName(apName(r.bssid)):(hop?"":"AP")))}</text>`;
   });
   rows.forEach(r=>{ const top=y(r.gap); h+=`<rect x="${x(r.t)-bw/2}" y="${top}" width="${bw}" height="${T+ih-top}" fill="${r.gap>1000?"var(--bad)":r.gap>500?"var(--warn)":r.gap>150?"var(--click)":"var(--bar)"}"/>`; });
   const pts=rows.filter(r=>r.rssi).map(r=>`${x(r.t)},${yr(r.rssi)}`).join(" ");
@@ -269,7 +304,7 @@ function chart(rows,maxT,maxG){
   svg.querySelector(".hit").onmousemove=e=>{
     const p=svg.getBoundingClientRect(), t=Math.round(((e.clientX-p.left)/p.width*W-L)/iw*maxT+0.5);
     const r=rows[t-1]; if(!r){tip.style.display="none";return}
-    tip.innerHTML=`<b>${r.t}s</b> ${esc(r.time)}<br>AP ${esc(r.bssid)} &middot; ${r.rssi} dBm &middot; ${r.freq} MHz<br>gap ${r.gap} ms &middot; loss ${r.loss}% &middot; rtt ${r.rtt} ms &middot; jitter ${r.jitter} ms${r.mark?"<br><b style='color:var(--mark)'>"+esc(r.mark)+"</b>":""}${r.event?"<br><b>"+esc(r.event)+"</b> ("+band((rows[t-2]||r).freq)+" → "+band(r.freq)+")":""}`;
+    tip.innerHTML=`<b>${r.t}s</b> ${esc(r.time)}<br>${apName(r.bssid)?"<b>"+esc(apName(r.bssid))+"</b> &middot; ":""}${esc(r.bssid)} &middot; ${r.rssi} dBm &middot; ${r.freq} MHz<br>gap ${r.gap} ms &middot; loss ${r.loss}% &middot; rtt ${r.rtt} ms &middot; jitter ${r.jitter} ms${r.mark?"<br><b style='color:var(--mark)'>"+esc(r.mark)+"</b>":""}${r.event?"<br><b>"+esc(r.event)+"</b> ("+band((rows[t-2]||r).freq)+" → "+band(r.freq)+")":""}`;
     tip.style.display="block"; tip.style.left=(e.clientX+14)+"px"; tip.style.top=(e.clientY+14)+"px";
   };
   svg.querySelector(".hit").onmouseleave=()=>tip.style.display="none";
@@ -278,6 +313,7 @@ function chart(rows,maxT,maxG){
 function esc(s){return String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]))}
 if(R){
   baseId=R.project.baseline||"";
+  apMap=R.project.aps||{};
   document.getElementById("projName").style.display="";
   document.getElementById("projName").textContent=R.project.name;
   document.getElementById("hint").textContent="Report exported "+R.exported+" · "+R.runs.length+" runs · tick runs to compare";

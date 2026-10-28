@@ -69,6 +69,7 @@ func main() {
 	mux.HandleFunc("/api/project/open", apiProjectOpen)
 	mux.HandleFunc("/api/project/rename", apiProjectRename)
 	mux.HandleFunc("/api/project/delete", apiProjectDelete)
+	mux.HandleFunc("/api/aps", apiAPs)
 	mux.HandleFunc("/api/export", apiExport)
 	go http.Serve(ln, mux)
 
@@ -322,6 +323,31 @@ func apiProjectDelete(w http.ResponseWriter, r *http.Request) {
 	st.saveCurrent()
 	st.bump()
 	w.Write([]byte("ok"))
+}
+
+// apiAPs takes text pasted from the Omada device list and stores MAC -> name
+// for the open project.
+func apiAPs(w http.ResponseWriter, r *http.Request) {
+	if !post(w, r) {
+		return
+	}
+	body, err := readAllLimit(r.Body)
+	if err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	aps := parseAPList(string(body))
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	p, ok := st.load(st.current)
+	if !ok {
+		http.Error(w, "no project", 404)
+		return
+	}
+	p.APs = aps
+	st.save(p)
+	st.bump()
+	writeJSON(w, map[string]any{"count": len(aps), "aps": aps})
 }
 
 func apiExport(w http.ResponseWriter, r *http.Request) {
